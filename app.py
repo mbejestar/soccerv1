@@ -23,55 +23,45 @@ Drop a trained **model.pkl** next to this file to use it; otherwise a transparen
 """)
 
 # ---------- Compatibility Patch for models trained on older scikit-learn ----------
+# ---------- Compatibility Patch for models trained on older scikit-learn ----------
 def patch_sklearn_compat(model):
-    """Add missing attributes introduced in newer sklearn to older pickled objects."""
+    """Add missing attributes expected by newer sklearn to older pickled objects."""
     try:
-        # Pipeline named "pre" -> ColumnTransformer
         pre = getattr(model, "named_steps", {}).get("pre")
         if pre is None or not hasattr(pre, "transformers_"):
             return model
+
         for name, trans, cols in pre.transformers_:
-            # our numeric branch is a Pipeline([("imp", SimpleImputer(...))])
+            # Numeric pipeline: SimpleImputer
             if hasattr(trans, "named_steps") and "imp" in trans.named_steps:
                 imp = trans.named_steps["imp"]
-                # scikit-learn>=1.3 added keep_empty_features on SimpleImputer
                 if not hasattr(imp, "keep_empty_features"):
                     imp.keep_empty_features = False
+
+            # Categorical branch may be a direct OneHotEncoder or inside a pipeline
+            enc = None
+            if hasattr(trans, "named_steps"):
+                # e.g., Pipeline(..., ("ohe", OneHotEncoder(...)))
+                enc = trans.named_steps.get("ohe")
+            elif str(type(trans)).endswith("OneHotEncoder'>"):
+                enc = trans
+
+            # Fallback: if it's directly a OneHotEncoder without import/type check
+            if enc is None and hasattr(trans, "categories_") and hasattr(trans, "transform"):
+                # heuristic: looks like a fitted encoder
+                enc = trans
+
+            if enc is not None:
+                # sklearn>=1.4 looks for a private attr; older pickles won't have it
+                if not hasattr(enc, "_drop_idx_after_grouping"):
+                    enc._drop_idx_after_grouping = None
+                # also ensure public .drop exists (older may miss it)
+                if not hasattr(enc, "drop"):
+                    enc.drop = None
     except Exception:
-        # If anything goes wrong, we just skip patching—app will still try to run.
         pass
     return model
 
-# ---------- Load model (supports two filenames) and patch ----------
-MODEL = None
-LABEL_ORDER = DEFAULT_CLASS_ORDER  # ['H','D','A']
-model_load_note = None
-for candidate in ["model.pkl", "model_international.pkl"]:
-    if MODEL is None:
-        try:
-            MODEL = load(candidate)
-            MODEL = patch_sklearn_compat(MODEL)
-            model_load_note = f"Model loaded ({candidate})."
-        except Exception:
-            pass
-
-if MODEL is not None:
-    st.success(model_load_note)
-else:
-    st.info("No model file found — using fallback (form + odds blend).")
-
-# ---------- Detect whether the trained pipeline expects odds columns ----------
-def model_expects_odds(model) -> bool:
-    try:
-        pre = model.named_steps.get("pre", None)
-        if pre and hasattr(pre, "transformers_"):
-            for name, trans, cols in pre.transformers_:
-                if name == "num":
-                    cols_set = set([str(c) for c in cols])
-                    return {"Odds_H", "Odds_D", "Odds_A"}.issubset(cols_set)
-    except Exception:
-        pass
-    return False
 
 expects_odds = model_expects_odds(MODEL) if MODEL is not None else False
 
