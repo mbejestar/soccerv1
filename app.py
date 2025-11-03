@@ -22,15 +22,35 @@ Predict **Home/Draw/Away** using:
 Drop a trained **model.pkl** next to this file to use it; otherwise a transparent **form+odds** fallback is used.
 """)
 
-# --- Try to load a model (model.pkl first, then model_international.pkl) ---
+# ---------- Compatibility Patch for models trained on older scikit-learn ----------
+def patch_sklearn_compat(model):
+    """Add missing attributes introduced in newer sklearn to older pickled objects."""
+    try:
+        # Pipeline named "pre" -> ColumnTransformer
+        pre = getattr(model, "named_steps", {}).get("pre")
+        if pre is None or not hasattr(pre, "transformers_"):
+            return model
+        for name, trans, cols in pre.transformers_:
+            # our numeric branch is a Pipeline([("imp", SimpleImputer(...))])
+            if hasattr(trans, "named_steps") and "imp" in trans.named_steps:
+                imp = trans.named_steps["imp"]
+                # scikit-learn>=1.3 added keep_empty_features on SimpleImputer
+                if not hasattr(imp, "keep_empty_features"):
+                    imp.keep_empty_features = False
+    except Exception:
+        # If anything goes wrong, we just skip patching—app will still try to run.
+        pass
+    return model
+
+# ---------- Load model (supports two filenames) and patch ----------
 MODEL = None
 LABEL_ORDER = DEFAULT_CLASS_ORDER  # ['H','D','A']
 model_load_note = None
-
 for candidate in ["model.pkl", "model_international.pkl"]:
     if MODEL is None:
         try:
             MODEL = load(candidate)
+            MODEL = patch_sklearn_compat(MODEL)
             model_load_note = f"Model loaded ({candidate})."
         except Exception:
             pass
@@ -40,7 +60,7 @@ if MODEL is not None:
 else:
     st.info("No model file found — using fallback (form + odds blend).")
 
-# --- Helper: detect if the trained pipeline expects odds columns ---
+# ---------- Detect whether the trained pipeline expects odds columns ----------
 def model_expects_odds(model) -> bool:
     try:
         pre = model.named_steps.get("pre", None)
@@ -55,6 +75,7 @@ def model_expects_odds(model) -> bool:
 
 expects_odds = model_expects_odds(MODEL) if MODEL is not None else False
 
+# ---------- UI ----------
 with st.form("inputs"):
     colA, colB = st.columns(2)
     with colA:
@@ -83,37 +104,38 @@ with st.form("inputs"):
     w = st.slider("Blend weight (model/form vs odds)", 0.0, 1.0, 0.6, 0.05)
     submitted = st.form_submit_button("Predict")
 
+# ---------- Predict ----------
 if submitted:
-    # Convert odds to implied probs if requested
     p_odds = implied_probs_from_odds(home_odds, draw_odds, away_odds) if use_odds else None
 
     if MODEL is not None:
-        # Build input row for the trained pipeline
         X = pd.DataFrame([{
             "Home_ppg5": home_ppg5, "Home_gd5": home_gd5,
             "Away_ppg5": away_ppg5, "Away_gd5": away_gd5,
             "HomeTeam": home_team, "AwayTeam": away_team
         }])
 
-        # Add odds columns IFF the trained model expects them
+        # Add odds cols if the model expects them
         if expects_odds:
             if use_odds and p_odds is not None:
                 X["Odds_H"], X["Odds_D"], X["Odds_A"] = float(p_odds[0]), float(p_odds[1]), float(p_odds[2])
             else:
-                # Model expects odds → pass NaN (imputer will handle)
                 X["Odds_H"], X["Odds_D"], X["Odds_A"] = np.nan, np.nan, np.nan
+
+        # Ensure numeric cols are numeric (median imputer needs float)
+        for c in ["Home_ppg5","Home_gd5","Away_ppg5","Away_gd5","Odds_H","Odds_D","Odds_A"]:
+            if c in X.columns:
+                X[c] = pd.to_numeric(X[c], errors="coerce")
 
         try:
             proba = MODEL.predict_proba(X)[0]
-            # Align to [H, D, A]
             if hasattr(MODEL, "classes_"):
-                proba = ensure_order(proba, MODEL.classes_, LABEL_ORDER)
+                proba = ensure_order(proba, MODEL.classes_, DEFAULT_CLASS_ORDER)
             p_model = np.array([proba[0], proba[1], proba[2]])
             source = "Model"
         except Exception as e:
-            st.error("Prediction failed. See details below.")
+            st.error("Prediction failed. Falling back to form heuristic. See details below.")
             st.exception(e)
-            # graceful fallback so the app still returns something
             p_home = 0.40 + 0.12*(home_ppg5 - away_ppg5) + 0.08*(home_gd5 - away_gd5)
             p_draw = 0.28
             p_away = 1 - p_home - p_draw
@@ -121,7 +143,7 @@ if submitted:
             p_model = p_model/np.sum(p_model)
             source = "Form-only fallback (after error)"
     else:
-        # No model: form-only heuristic
+        # No model: heuristic
         p_home = 0.40 + 0.12*(home_ppg5 - away_ppg5) + 0.08*(home_gd5 - away_gd5)
         p_draw = 0.28
         p_away = 1 - p_home - p_draw
