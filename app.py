@@ -1,9 +1,14 @@
-
 import streamlit as st
 import numpy as np
 import pandas as pd
 from joblib import load
-from model_utils import implied_probs_from_odds, blend_probs, compute_form_from_last5, ensure_order, DEFAULT_CLASS_ORDER
+from model_utils import (
+    implied_probs_from_odds,
+    blend_probs,
+    compute_form_from_last5,
+    ensure_order,
+    DEFAULT_CLASS_ORDER,
+)
 
 st.set_page_config(page_title="Global Football Match Predictor", page_icon="⚽", layout="centered")
 st.title("⚽ Global Football Match Predictor")
@@ -62,6 +67,14 @@ if submitted:
             "Away_ppg5": away_ppg5, "Away_gd5": away_gd5,
             "HomeTeam": home_team, "AwayTeam": away_team
         }])
+
+        # Add odds columns expected by the model
+        if use_odds:
+            ip = implied_probs_from_odds(home_odds, draw_odds, away_odds)  # [H,D,A]
+            X["Odds_H"], X["Odds_D"], X["Odds_A"] = float(ip[0]), float(ip[1]), float(ip[2])
+        else:
+            X["Odds_H"], X["Odds_D"], X["Odds_A"] = np.nan, np.nan, np.nan
+
         proba = MODEL.predict_proba(X)[0]
         if hasattr(MODEL, "classes_"):
             proba = ensure_order(proba, MODEL.classes_, LABEL_ORDER)
@@ -79,12 +92,11 @@ if submitted:
         p_final = p_model
         details = {"Model/Form": np.round(p_model, 3)}
     else:
-        from model_utils import blend_probs
         p_final = blend_probs(p_model, p_odds, w)
         details = {"Model/Form": np.round(p_model, 3), "Odds": np.round(p_odds, 3), "Blend": np.round(p_final, 3)}
 
-    labels = ["Home","Draw","Away"]
+    labels = ["Home", "Draw", "Away"]
     st.subheader("Predicted Probabilities")
-    st.write({labels[i]: float(np.round(p_final[i],3)) for i in range(3)})
+    st.write({labels[i]: float(np.round(p_final[i], 3)) for i in range(3)})
     st.bar_chart(pd.DataFrame(details, index=labels))
     st.caption(f"Label order [H, D, A]. Source: {source}.")
