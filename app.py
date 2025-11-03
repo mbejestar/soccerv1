@@ -24,11 +24,12 @@ Drop a trained **model.pkl** next to this file to use it; otherwise a transparen
 """)
 
 # ---------------- COMPAT PATCHES ----------------
+# ---------- Compatibility Patch for models trained on older scikit-learn ----------
 def patch_sklearn_compat(model):
     """
     Patch older pickled sklearn objects so they run on newer sklearn.
     - SimpleImputer: add keep_empty_features if missing
-    - OneHotEncoder: add _drop_idx_after_grouping / drop if missing
+    - OneHotEncoder: add _drop_idx_after_grouping / drop / sparse_output shim
     """
     try:
         if not hasattr(model, "named_steps"):
@@ -38,46 +39,39 @@ def patch_sklearn_compat(model):
             return model
 
         for name, trans, cols in pre.transformers_:
-            # Numeric pipeline -> look for SimpleImputer named 'imp'
+            # Numeric pipeline -> SimpleImputer named 'imp'
             if hasattr(trans, "named_steps") and "imp" in trans.named_steps:
                 imp = trans.named_steps["imp"]
                 if not hasattr(imp, "keep_empty_features"):
                     imp.keep_empty_features = False
 
-            # Find OneHotEncoder (could be direct or inside a Pipeline step named 'ohe')
+            # Find OneHotEncoder (direct or in a pipeline step 'ohe')
             enc = None
             if hasattr(trans, "named_steps"):
                 enc = trans.named_steps.get("ohe")
             elif "OneHotEncoder" in str(type(trans)):
                 enc = trans
-            # Heuristic fallback: a fitted encoder has 'categories_' and 'transform'
             if enc is None and hasattr(trans, "categories_") and hasattr(trans, "transform"):
-                enc = trans
+                enc = trans  # heuristic
 
             if enc is not None:
+                # Private attr added in newer sklearn
                 if not hasattr(enc, "_drop_idx_after_grouping"):
                     enc._drop_idx_after_grouping = None
+                # Public 'drop' may be absent on very old pickles
                 if not hasattr(enc, "drop"):
                     enc.drop = None
+                # ---- key shim: sparse vs sparse_output rename across versions ----
+                # Older pickles store 'sparse' (bool). Newer sklearn expects 'sparse_output'.
+                if hasattr(enc, "sparse") and not hasattr(enc, "sparse_output"):
+                    enc.sparse_output = bool(enc.sparse)
+                # Conversely, if only sparse_output exists, ensure sparse exists for older code paths
+                if hasattr(enc, "sparse_output") and not hasattr(enc, "sparse"):
+                    enc.sparse = bool(enc.sparse_output)
     except Exception:
-        # If patching fails, continue; we'll still try to run
         pass
     return model
 
-def model_expects_odds(model) -> bool:
-    """Check if the trained preprocessor expects Odds_H/D/A numeric columns."""
-    try:
-        if not hasattr(model, "named_steps"):
-            return False
-        pre = model.named_steps.get("pre")
-        if pre and hasattr(pre, "transformers_"):
-            for name, trans, cols in pre.transformers_:
-                if name == "num":
-                    cols_set = set([str(c) for c in cols])
-                    return {"Odds_H", "Odds_D", "Odds_A"}.issubset(cols_set)
-    except Exception:
-        pass
-    return False
 
 # ---------------- LOAD MODEL ----------------
 MODEL = None
