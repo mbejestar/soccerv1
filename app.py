@@ -1,9 +1,15 @@
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+
 import streamlit as st
 import numpy as np
 import pandas as pd
 from joblib import load
 
-# Your helper functions live here
+# ===== helper utilities you already have =====
 from model_utils import (
     implied_probs_from_odds,
     blend_probs,
@@ -12,7 +18,7 @@ from model_utils import (
     DEFAULT_CLASS_ORDER,
 )
 
-# ---------------- UI SETUP ----------------
+# ===== UI SETUP =====
 st.set_page_config(page_title="Global Football Match Predictor", page_icon="⚽", layout="centered")
 st.title("⚽ Global Football Match Predictor")
 st.markdown("""
@@ -23,13 +29,12 @@ Predict **Home/Draw/Away** using:
 Drop a trained **model.pkl** next to this file to use it; otherwise a transparent **form+odds** fallback is used.
 """)
 
-# ---------------- COMPAT PATCHES ----------------
-# ---------- Compatibility Patch for models trained on older scikit-learn ----------
+# ===== COMPAT PATCHES =====
 def patch_sklearn_compat(model):
     """
-    Patch older pickled sklearn objects so they run on newer sklearn.
+    Make older pickled sklearn pipelines run on newer sklearn (1.7.x).
     - SimpleImputer: add keep_empty_features if missing
-    - OneHotEncoder: add _drop_idx_after_grouping / drop / sparse_output shim
+    - OneHotEncoder: add private/public attrs and sparse_output shim
     """
     try:
         if not hasattr(model, "named_steps"):
@@ -39,13 +44,13 @@ def patch_sklearn_compat(model):
             return model
 
         for name, trans, cols in pre.transformers_:
-            # Numeric pipeline -> SimpleImputer named 'imp'
+            # Numeric branch: Pipeline(..., ("imp", SimpleImputer(...)))
             if hasattr(trans, "named_steps") and "imp" in trans.named_steps:
                 imp = trans.named_steps["imp"]
                 if not hasattr(imp, "keep_empty_features"):
                     imp.keep_empty_features = False
 
-            # Find OneHotEncoder (direct or in a pipeline step 'ohe')
+            # Find a fitted OneHotEncoder (could be direct or inside Pipeline as 'ohe')
             enc = None
             if hasattr(trans, "named_steps"):
                 enc = trans.named_steps.get("ohe")
@@ -55,25 +60,44 @@ def patch_sklearn_compat(model):
                 enc = trans  # heuristic
 
             if enc is not None:
-                # Private attr added in newer sklearn
+                # newer sklearn checks this private attr
                 if not hasattr(enc, "_drop_idx_after_grouping"):
                     enc._drop_idx_after_grouping = None
-                # Public 'drop' may be absent on very old pickles
+                # ensure public .drop exists
                 if not hasattr(enc, "drop"):
                     enc.drop = None
-                # ---- key shim: sparse vs sparse_output rename across versions ----
-                # Older pickles store 'sparse' (bool). Newer sklearn expects 'sparse_output'.
+                # shim for sparse -> sparse_output rename
                 if hasattr(enc, "sparse") and not hasattr(enc, "sparse_output"):
-                    enc.sparse_output = bool(enc.sparse)
-                # Conversely, if only sparse_output exists, ensure sparse exists for older code paths
+                    try:
+                        enc.sparse_output = bool(enc.sparse)
+                    except Exception:
+                        enc.sparse_output = False
                 if hasattr(enc, "sparse_output") and not hasattr(enc, "sparse"):
-                    enc.sparse = bool(enc.sparse_output)
+                    try:
+                        enc.sparse = bool(enc.sparse_output)
+                    except Exception:
+                        enc.sparse = False
     except Exception:
+        # don't crash patching
         pass
     return model
 
+def model_expects_odds(model) -> bool:
+    """Return True if the trained preprocessor expects numeric columns Odds_H/D/A."""
+    try:
+        if not hasattr(model, "named_steps"):
+            return False
+        pre = model.named_steps.get("pre")
+        if pre and hasattr(pre, "transformers_"):
+            for name, trans, cols in pre.transformers_:
+                if name == "num":
+                    cols_set = set([str(c) for c in cols])
+                    return {"Odds_H", "Odds_D", "Odds_A"}.issubset(cols_set)
+    except Exception:
+        pass
+    return False
 
-# ---------------- LOAD MODEL ----------------
+# ===== LOAD MODEL =====
 MODEL = None
 LABEL_ORDER = DEFAULT_CLASS_ORDER  # ['H','D','A']
 model_load_note = None
@@ -94,7 +118,7 @@ else:
 
 expects_odds = model_expects_odds(MODEL) if MODEL is not None else False
 
-# ---------------- FORM ----------------
+# ===== FORM =====
 with st.form("inputs"):
     colA, colB = st.columns(2)
     with colA:
@@ -123,34 +147,33 @@ with st.form("inputs"):
     w = st.slider("Blend weight (model/form vs odds)", 0.0, 1.0, 0.6, 0.05)
     submitted = st.form_submit_button("Predict")
 
-# ---------------- PREDICT ----------------
+# ===== PREDICT =====
 if submitted:
-    # Convert odds to implied probability if requested
+    # NOTE: make sure users use dots not commas for decimals (e.g., 1.60 not 1,60)
     p_odds = implied_probs_from_odds(home_odds, draw_odds, away_odds) if use_odds else None
 
     if MODEL is not None:
-        # Build input row for the trained pipeline
+        # build input row for the trained pipeline
         X = pd.DataFrame([{
             "Home_ppg5": home_ppg5, "Home_gd5": home_gd5,
             "Away_ppg5": away_ppg5, "Away_gd5": away_gd5,
             "HomeTeam": home_team, "AwayTeam": away_team
         }])
 
-        # Add odds columns if the model expects them
+        # odds columns if expected
         if expects_odds:
             if use_odds and p_odds is not None:
                 X["Odds_H"], X["Odds_D"], X["Odds_A"] = float(p_odds[0]), float(p_odds[1]), float(p_odds[2])
             else:
                 X["Odds_H"], X["Odds_D"], X["Odds_A"] = np.nan, np.nan, np.nan
 
-        # Ensure numeric types for numeric cols (imputer expects floats)
+        # ensure numeric dtypes
         for c in ["Home_ppg5","Home_gd5","Away_ppg5","Away_gd5","Odds_H","Odds_D","Odds_A"]:
             if c in X.columns:
                 X[c] = pd.to_numeric(X[c], errors="coerce")
 
         try:
             proba = MODEL.predict_proba(X)[0]
-            # Align order to ['H','D','A']
             if hasattr(MODEL, "classes_"):
                 proba = ensure_order(proba, MODEL.classes_, LABEL_ORDER)
             p_model = np.array([proba[0], proba[1], proba[2]])
@@ -165,7 +188,7 @@ if submitted:
             p_model = p_model/np.sum(p_model)
             source = "Form-only fallback (after error)"
     else:
-        # No model: form-only heuristic
+        # no model: heuristic
         p_home = 0.40 + 0.12*(home_ppg5 - away_ppg5) + 0.08*(home_gd5 - away_gd5)
         p_draw = 0.28
         p_away = 1 - p_home - p_draw
@@ -173,7 +196,7 @@ if submitted:
         p_model = p_model/np.sum(p_model)
         source = "Form-only fallback"
 
-    # Blend with odds if provided
+    # blend with odds if provided
     if p_odds is None:
         p_final = p_model
         details = {"Model/Form": np.round(p_model, 3)}
